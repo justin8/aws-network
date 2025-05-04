@@ -1,18 +1,40 @@
 import * as cdk from 'aws-cdk-lib';
 import * as autoscaling from 'aws-cdk-lib/aws-autoscaling';
 import * as ec2 from 'aws-cdk-lib/aws-ec2';
+import * as events from 'aws-cdk-lib/aws-events';
+import * as targets from 'aws-cdk-lib/aws-events-targets';
 import * as iam from 'aws-cdk-lib/aws-iam';
+import * as lambda from 'aws-cdk-lib/aws-lambda';
 import { Construct } from 'constructs';
 import * as fs from 'fs';
 import * as path from 'path';
+
 
 export class AwsNetworkStack extends cdk.Stack {
   constructor(scope: Construct, id: string, props?: cdk.StackProps) {
     super(scope, id, props);
 
-    // Lookup the default VPC
+    const instanceType = 't4g.nano';
+
     const vpc = ec2.Vpc.fromLookup(this, 'DefaultVPC', { isDefault: true });
 
+    const { asg, instanceRole, vpcAccessSecurityGroup } = this.wireguardInstance(vpc, instanceType);
+
+    this.priceOptimizer(vpc, asg, instanceType);
+
+  }
+
+  /**
+   * Creates a WireGuard instance in the specified VPC.
+   * @param vpc The VPC where the instance will be created.
+   * @param instanceType The type of instance to create.
+   * @returns An object containing the Auto Scaling Group, instance role, and security group.
+   */
+  wireguardInstance(vpc: ec2.IVpc, instanceType: string): {
+    asg: autoscaling.AutoScalingGroup,
+    instanceRole: iam.IRole,
+    vpcAccessSecurityGroup: ec2.ISecurityGroup,
+  } {
 
     // Read the WireGuard configuration file from the repository
     const wireguardConfigPath = path.join(__dirname, 'wireguard.conf');
@@ -67,5 +89,46 @@ export class AwsNetworkStack extends cdk.Stack {
       desiredCapacity: 1,
       updatePolicy: autoscaling.UpdatePolicy.rollingUpdate(),
     });
+
+    return { asg, instanceRole, vpcAccessSecurityGroup };
+  }
+
+  /**
+   * Creates a Lambda function to optimize the Auto Scaling Group based on spot prices.
+   * @param vpc The VPC where the instance is created.
+   * @param asg The Auto Scaling Group to optimize.
+   * @param instanceType The type of instance to optimize.
+   */
+  priceOptimizer(vpc: ec2.IVpc, asg: autoscaling.AutoScalingGroup, instanceType: string): void {
+    const azList = vpc.publicSubnets.map((subnet) => subnet.availabilityZone);
+    const subnetIds = vpc.publicSubnets.map((subnet) => subnet.subnetId);
+
+    const fn = new lambda.Function(this, 'OptimizeAsgFunction', {
+      runtime: lambda.Runtime.PYTHON_3_12,
+      handler: 'index.lambda_handler',
+      code: lambda.Code.fromAsset("src/priceOptimizer"),
+      timeout: cdk.Duration.seconds(30),
+      environment: {
+        ASG_NAME: asg.autoScalingGroupName,
+        INSTANCE_TYPE: instanceType,
+        AZ_LIST: azList.join(','),
+        SUBNET_IDS: subnetIds.join(',')
+      }
+    });
+
+    fn.addToRolePolicy(new iam.PolicyStatement({
+      actions: [
+        'ec2:DescribeSpotPriceHistory',
+        'ec2:DescribeSubnets',
+        'autoscaling:UpdateAutoScalingGroup'
+      ],
+      resources: ['*']
+    }));
+
+    new events.Rule(this, 'OptimizeAsgScheduleRule', {
+      schedule: events.Schedule.rate(cdk.Duration.hours(1)),
+      targets: [new targets.LambdaFunction(fn)],
+    });
+
   }
 }
