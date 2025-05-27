@@ -16,7 +16,7 @@ export class AwsNetworkStack extends cdk.Stack {
 
     const instanceType = 't4g.nano';
     const vpc = this.createVpc();
-    const { asg, instanceRole, vpcAccessSecurityGroup } = this.wireguardInstance(vpc, instanceType);
+    const { asg, instanceRole, vpnAccessSecurityGroup } = this.wireguardInstance(vpc, instanceType);
     this.priceOptimizer(vpc, asg, instanceType);
   }
 
@@ -50,7 +50,7 @@ export class AwsNetworkStack extends cdk.Stack {
   wireguardInstance(vpc: ec2.IVpc, instanceType: string): {
     asg: autoscaling.AutoScalingGroup,
     instanceRole: iam.IRole,
-    vpcAccessSecurityGroup: ec2.ISecurityGroup,
+    vpnAccessSecurityGroup: ec2.ISecurityGroup,
   } {
 
     // Read the WireGuard configuration file from the repository
@@ -68,6 +68,9 @@ export class AwsNetworkStack extends cdk.Stack {
       'sudo iptables -t nat -A POSTROUTING -o wg0 -j MASQUERADE',
       'sudo iptables-save > /etc/sysconfig/iptables',
       `echo "${wireguardConfig}" > /etc/wireguard/wg0.conf`,
+
+      'echo module wireguard +p > /sys/kernel/debug/dynamic_debug/control',
+
       'sudo systemctl enable wg-quick@wg0',
       'sudo systemctl start wg-quick@wg0',
       'TOKEN=$(curl -X PUT "http://169.254.169.254/latest/api/token" \
@@ -87,8 +90,8 @@ export class AwsNetworkStack extends cdk.Stack {
     const securityGroup = new ec2.SecurityGroup(this, 'InstanceSecurityGroup', { vpc, allowAllIpv6Outbound: true });
     securityGroup.addIngressRule(ec2.Peer.ipv4(vpc.vpcCidrBlock), ec2.Port.allTraffic(), 'Allow all traffic from VPC');
 
-    const vpcAccessSecurityGroup = new ec2.SecurityGroup(this, 'VpcAccessSecurityGroup', { vpc, securityGroupName: 'VpcAccessSecurityGroup', allowAllOutbound: false });
-    vpcAccessSecurityGroup.addEgressRule(ec2.Peer.securityGroupId(securityGroup.securityGroupId), ec2.Port.allTraffic(), 'Allow all traffic to the WireGuard instance');
+    const vpnAccessSecurityGroup = new ec2.SecurityGroup(this, 'VpnAccessSecurityGroup', { vpc, securityGroupName: 'VpnAccessSecurityGroup', allowAllOutbound: false });
+    vpnAccessSecurityGroup.addEgressRule(ec2.Peer.securityGroupId(securityGroup.securityGroupId), ec2.Port.allTraffic(), 'Allow all traffic to the WireGuard instance');
 
     // Define a launch template for the Auto Scaling Group
     const launchTemplate = new ec2.LaunchTemplate(this, 'LaunchTemplate', {
@@ -112,7 +115,7 @@ export class AwsNetworkStack extends cdk.Stack {
       vpcSubnets: vpc.selectSubnets({ subnetType: ec2.SubnetType.PUBLIC }),
     });
 
-    return { asg, instanceRole, vpcAccessSecurityGroup };
+    return { asg, instanceRole, vpnAccessSecurityGroup: vpnAccessSecurityGroup };
   }
 
   /**
