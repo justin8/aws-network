@@ -15,13 +15,30 @@ export class AwsNetworkStack extends cdk.Stack {
     super(scope, id, props);
 
     const instanceType = 't4g.nano';
-
-    const vpc = ec2.Vpc.fromLookup(this, 'DefaultVPC', { isDefault: true });
-
+    const vpc = this.createVpc();
     const { asg, instanceRole, vpcAccessSecurityGroup } = this.wireguardInstance(vpc, instanceType);
-
     this.priceOptimizer(vpc, asg, instanceType);
+  }
 
+  /**
+   * Creates a VPC with public subnets in all available AZs
+   * @returns The created VPC
+   */
+  private createVpc(): ec2.Vpc {
+    return new ec2.Vpc(this, "vpc", {
+      ipProtocol: ec2.IpProtocol.DUAL_STACK,
+      natGateways: 0,
+      maxAzs: 6,
+      subnetConfiguration: [
+        {
+          name: 'Public',
+          subnetType: ec2.SubnetType.PUBLIC,
+          cidrMask: 24,
+          mapPublicIpOnLaunch: false,
+          ipv6AssignAddressOnCreation: true,
+        }
+      ],
+    });
   }
 
   /**
@@ -44,6 +61,8 @@ export class AwsNetworkStack extends cdk.Stack {
     const userData = ec2.UserData.forLinux();
     userData.addCommands(
       'set -x',
+      'echo "export AWS_USE_DUALSTACK_ENDPOINT=true" >> /etc/environment',
+      'export AWS_USE_DUALSTACK_ENDPOINT=true',
       'sudo dnf install -y wireguard-tools iproute iptables',
       'sudo sysctl -w net.ipv4.ip_forward=1',
       'sudo iptables -t nat -A POSTROUTING -o wg0 -j MASQUERADE',
@@ -56,18 +75,19 @@ export class AwsNetworkStack extends cdk.Stack {
       'INSTANCE_ID=$(curl -H "X-aws-ec2-metadata-token: $TOKEN" \
   -s http://169.254.169.254/latest/meta-data/instance-id)',
       'aws ec2 modify-instance-attribute --instance-id $INSTANCE_ID --source-dest-check \'{"Value": false}\'',
-      `aws ec2 replace-route --route-table-id ${vpc.publicSubnets[0].routeTable.routeTableId} --destination-cidr-block 192.168.4.0/24 --instance-id $INSTANCE_ID`
+      'for ROUTE_TABLE_ID in ' + vpc.publicSubnets.map(subnet => subnet.routeTable.routeTableId).join(' ') + '; do',
+      '  aws ec2 replace-route --route-table-id $ROUTE_TABLE_ID --destination-cidr-block 192.168.4.0/24 --instance-id $INSTANCE_ID || aws ec2 create-route --route-table-id $ROUTE_TABLE_ID --destination-cidr-block 192.168.4.0/24 --instance-id $INSTANCE_ID',
+      'done'
     );
 
     const instanceRole = new iam.Role(this, 'InstanceRole', { assumedBy: new iam.ServicePrincipal('ec2.amazonaws.com') });
     instanceRole.addManagedPolicy(iam.ManagedPolicy.fromAwsManagedPolicyName('AmazonSSMManagedInstanceCore'));
-    instanceRole.addToPolicy(new iam.PolicyStatement({ actions: ['ec2:ReplaceRoute', 'ec2:ModifyInstanceAttribute'], resources: ['*'] }));
+    instanceRole.addToPolicy(new iam.PolicyStatement({ actions: ['ec2:ReplaceRoute', 'ec2:CreateRoute', 'ec2:ModifyInstanceAttribute'], resources: ['*'] }));
 
-    const securityGroup = new ec2.SecurityGroup(this, 'InstanceSecurityGroup', { vpc });
-    // securityGroup.addIngressRule(ec2.Peer.anyIpv4(), ec2.Port.udp(51820), 'Allow WireGuard traffic');
+    const securityGroup = new ec2.SecurityGroup(this, 'InstanceSecurityGroup', { vpc, allowAllIpv6Outbound: true });
     securityGroup.addIngressRule(ec2.Peer.ipv4(vpc.vpcCidrBlock), ec2.Port.allTraffic(), 'Allow all traffic from VPC');
 
-    const vpcAccessSecurityGroup = new ec2.SecurityGroup(this, 'VpcAccessSecurityGroup', { vpc, securityGroupName: 'VpcAccessSecurityGroup' });
+    const vpcAccessSecurityGroup = new ec2.SecurityGroup(this, 'VpcAccessSecurityGroup', { vpc, securityGroupName: 'VpcAccessSecurityGroup', allowAllOutbound: false });
     vpcAccessSecurityGroup.addEgressRule(ec2.Peer.securityGroupId(securityGroup.securityGroupId), ec2.Port.allTraffic(), 'Allow all traffic to the WireGuard instance');
 
     // Define a launch template for the Auto Scaling Group
@@ -77,7 +97,8 @@ export class AwsNetworkStack extends cdk.Stack {
       userData,
       role: instanceRole,
       securityGroup,
-      spotOptions: {}
+      spotOptions: {},
+      associatePublicIpAddress: false
     });
 
     // Create an Auto Scaling Group
@@ -88,6 +109,7 @@ export class AwsNetworkStack extends cdk.Stack {
       maxCapacity: 2,
       desiredCapacity: 1,
       updatePolicy: autoscaling.UpdatePolicy.rollingUpdate(),
+      vpcSubnets: vpc.selectSubnets({ subnetType: ec2.SubnetType.PUBLIC }),
     });
 
     return { asg, instanceRole, vpcAccessSecurityGroup };
